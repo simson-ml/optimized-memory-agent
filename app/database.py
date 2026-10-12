@@ -1,5 +1,8 @@
+import threading
+from contextlib import contextmanager
 import psycopg
 from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool
 from .config import settings
 
 SCHEMA = """
@@ -15,53 +18,66 @@ CREATE TABLE IF NOT EXISTS conversations (
     indexed BOOLEAN NOT NULL DEFAULT FALSE
 );
 
--- Migrations for older database versions
-ALTER TABLE conversations
-ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ
-DEFAULT CURRENT_TIMESTAMP;
-
-ALTER TABLE conversations
-ADD COLUMN IF NOT EXISTS prompt TEXT;
-
-ALTER TABLE conversations
-ADD COLUMN IF NOT EXISTS response TEXT;
-
-ALTER TABLE conversations
-ADD COLUMN IF NOT EXISTS memory_type TEXT
-DEFAULT 'conversation';
-
-ALTER TABLE conversations
-ADD COLUMN IF NOT EXISTS importance REAL
-DEFAULT 0.3;
-
-ALTER TABLE conversations
-ADD COLUMN IF NOT EXISTS source TEXT
-DEFAULT 'user_conversation';
-
-ALTER TABLE conversations
-ADD COLUMN IF NOT EXISTS indexed BOOLEAN
-DEFAULT FALSE;
-
-CREATE INDEX IF NOT EXISTS idx_conversations_indexed
-ON conversations(indexed);
-
 CREATE INDEX IF NOT EXISTS idx_conversations_created_at
 ON conversations(created_at DESC);
 
 CREATE INDEX IF NOT EXISTS idx_conversations_memory_type
 ON conversations(memory_type);
+
+CREATE INDEX IF NOT EXISTS idx_conversations_unindexed
+ON conversations(id) WHERE indexed = FALSE;
 """
 
+_pool: ConnectionPool | None = None
+_pool_lock = threading.Lock()
 
+
+def get_pool() -> ConnectionPool:
+    global _pool
+    if _pool is None:
+        with _pool_lock:
+            if _pool is None:
+                conninfo = (
+                    f"dbname={settings.dbname} "
+                    f"user={settings.user} "
+                    f"password={settings.password} "
+                    f"host={settings.host} "
+                    f"port={settings.port}"
+                )
+                _pool = ConnectionPool(
+                    conninfo=conninfo,
+                    min_size=settings.pg_pool_min,
+                    max_size=settings.pg_pool_max,
+                    timeout=settings.pg_pool_timeout,
+                    kwargs={"row_factory": dict_row},
+                    open=True,
+                )
+    return _pool
+
+
+import atexit
+
+
+def close_pool():
+    global _pool
+    with _pool_lock:
+        if _pool is not None:
+            try:
+                _pool.close()
+            except Exception:
+                pass
+            _pool = None
+
+
+atexit.register(close_pool)
+
+
+@contextmanager
 def connect():
-    return psycopg.connect(
-        dbname=settings.dbname,
-        user=settings.user,
-        password=settings.password,
-        host=settings.host,
-        port=settings.port,
-        row_factory=dict_row,
-    )
+    """Yields a connection from the connection pool, auto-committing on normal exit."""
+    pool = get_pool()
+    with pool.connection() as conn:
+        yield conn
 
 
 def initialize():
@@ -100,6 +116,17 @@ def mark_indexed(i, v=True):
             )
 
 
+def mark_batch_indexed(ids: list[int], v=True):
+    if not ids:
+        return
+    with connect() as c:
+        with c.cursor() as cur:
+            cur.execute(
+                "UPDATE conversations SET indexed=%s WHERE id = ANY(%s)",
+                (v, ids),
+            )
+
+
 def get_unindexed(limit=1000):
     with connect() as c:
         with c.cursor() as cur:
@@ -114,6 +141,30 @@ def get_unindexed(limit=1000):
                 (limit,),
             )
             return cur.fetchall()
+
+
+def get_records_by_ids(ids: list[int]):
+    if not ids:
+        return []
+    with connect() as c:
+        with c.cursor() as cur:
+            cur.execute(
+                """
+                SELECT *
+                FROM conversations
+                WHERE id = ANY(%s)
+                ORDER BY id
+                """,
+                (ids,),
+            )
+            return cur.fetchall()
+
+
+def get_all_record_ids() -> list[int]:
+    with connect() as c:
+        with c.cursor() as cur:
+            cur.execute("SELECT id FROM conversations ORDER BY id")
+            return [row["id"] for row in cur.fetchall()]
 
 
 def delete_record(i):
